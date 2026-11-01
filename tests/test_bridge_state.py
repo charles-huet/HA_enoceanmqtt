@@ -328,7 +328,12 @@ class BridgeStateTests(unittest.TestCase):
     def test_run_shuts_down_when_mqtt_loop_thread_stops(self):
         comm = self.make_communicator()
         comm.enocean = LoopOnceEnocean()
-        comm._mqtt_thread.alive = False
+        loop_start = comm.mqtt.loop_start
+
+        def loop_start_then_stop():
+            loop_start()
+            comm.mqtt._thread.alive = False
+        comm.mqtt.loop_start = loop_start_then_stop
 
         with self.assertLogs(level='ERROR') as logs:
             comm.run()

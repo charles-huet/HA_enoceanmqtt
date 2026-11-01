@@ -22,6 +22,8 @@ class Communicator:
     enocean = None
     BRIDGE_STATE_ONLINE = "online"
     BRIDGE_STATE_OFFLINE = "offline"
+    # Times the base ID is requested before connecting to MQTT without it
+    BASE_ID_ATTEMPTS = 10
 
     CONNECTION_RETURN_CODE = [
         "connection successful",
@@ -77,11 +79,10 @@ class Communicator:
                 self.mqtt.tls_insecure_set(True)
         if str(self.conf.get('mqtt_debug')) in ("True", "true", "1"):
             self.mqtt.enable_logger()
-        logging.debug("Connecting to host %s, port %s, keepalive %s",
-                      self.conf['mqtt_host'], mqtt_port, mqtt_keepalive)
-        self.mqtt.connect_async(self.conf['mqtt_host'], port=mqtt_port, keepalive=mqtt_keepalive)
-        self.mqtt.loop_start()
-        self._mqtt_thread = getattr(self.mqtt, "_thread", None)
+        # the connection is started by run(), once everything is initialized
+        self._mqtt_port = mqtt_port
+        self._mqtt_keepalive = mqtt_keepalive
+        self._mqtt_thread = None
 
         # setup enocean communication
         eport  = self.conf['enocean_port']
@@ -760,6 +761,9 @@ class Communicator:
             sender = [(sensor['sender'] >> i*8) & 0xff for i in reversed(range(4))]
         else:
             sender = self.enocean_sender
+        if sender is None:
+            logging.error("%s: cannot send, the base ID of the transceiver is not known yet", sensor['name'])
+            return
 
         # Check whether the learn bit should be set in the packet (only valid for RORG.BS1 and RORG.BS4)
         force_learn = False
@@ -921,9 +925,35 @@ class Communicator:
     #=============================================================================================
     # RUN LOOP
     #=============================================================================================
+    def _read_sender(self):
+        '''request the transmitter ID, if needed'''
+        if self.enocean_sender is None:
+            self.enocean_sender = self.enocean.base_id
+            if self.enocean_sender is not None:
+                self._log_gateway_info()
+
+    def _start_mqtt(self):
+        '''connect to the MQTT broker: MQTT messages can be handled from now on'''
+        logging.debug("Connecting to host %s, port %s, keepalive %s",
+                      self.conf['mqtt_host'], self._mqtt_port, self._mqtt_keepalive)
+        self.mqtt.connect_async(self.conf['mqtt_host'], port=self._mqtt_port, keepalive=self._mqtt_keepalive)
+        self.mqtt.loop_start()
+        self._mqtt_thread = getattr(self.mqtt, "_thread", None)
+
     def run(self):
         """the main loop with blocking enocean packet receive handler"""
         try:
+            # Request transmitter ID before connecting to MQTT, so that the commands
+            # received on connection (e.g. retained ones) can be sent
+            for _ in range(self.BASE_ID_ATTEMPTS):
+                self._read_sender()
+                if self.enocean_sender is not None or self._shutdown_requested:
+                    break
+            else:
+                logging.error("Base ID of the transceiver not received: "
+                              "commands of devices without a sender cannot be sent yet")
+            self._start_mqtt()
+
             # start endless loop for listening
             while not self._shutdown_requested:
                 if not self.enocean.is_alive():
@@ -933,9 +963,7 @@ class Communicator:
                     break
 
                 # Request transmitter ID, if needed
-                if self.enocean_sender is None:
-                    self.enocean_sender = self.enocean.base_id
-                    self._log_gateway_info()
+                self._read_sender()
 
                 # Loop to empty the queue...
                 try:
